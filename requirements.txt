@@ -1,0 +1,8 @@
+numpy
+pillow
+openai
+wikipedia-api
+wikipedia
+tenacity
+tiktoken
+tweepy
