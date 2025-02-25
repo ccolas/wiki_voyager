@@ -3,6 +3,7 @@ import os
 from shutil import copy
 from datetime import datetime
 import re
+import time
 import requests
 
 from openai import OpenAI
@@ -17,9 +18,9 @@ from tenacity import retry, wait_random_exponential, stop_after_attempt
 
 
 project_path = "/mnt/e85692fd-9cbc-4a8d-b5c5-9252bd9a34fd/Perso/Scratch/wikibot/"
-name = 'bot_1'
-params = dict(unwanted_strings=['wiki','Wiki','Category', 'List', 'Template', 'Help', 'ISO', 'User','Talk','Portal'])
+params = dict(unwanted_strings=['wiki','Wiki','Category', 'List', 'Template', 'Help', 'ISO', 'User','Talk','Portal'], text_model="gpt-4o-mini-2024-07-18", img_model="dall-e-3")
 handle = "@wiki_voyager"
+SKIP = ['tweet', 'publish', 'img']
 
 with open(project_path + '.api_openai', 'r') as f:
     openai_api_key = f.read()
@@ -33,25 +34,22 @@ class WikiBot:
         self.params = params
         self.bot_path = project_path + 'data/' + name + '/'
         self.img_path = self.bot_path + 'imgs/'
-        self.memory_path = self.bot_path + 'memory.pkl'
+        self.memory_path = self.bot_path + 'memory.jsonl'
 
         os.makedirs(self.bot_path, exist_ok=True)
         os.makedirs(self.img_path, exist_ok=True)
 
-        if os.path.exists(self.memory_path):
-            with open(self.memory_path, 'rb') as f:
-                self.memory = pickle.load(f)
-        else:
-            self.memory = dict(titles=[],
-                               pages=[],
-                               dates=[],
-                               ids=[],
-                               tweets=[])
+        self.page_titles = []
+        with open(self.memory_path, "r") as file:
+            # Read each line and parse it as JSON
+            for line in file:
+                datapoint = json.loads(line.strip())
+                self.page_titles.append(datapoint['title'])
 
         self.setup_apis()
 
         self.last_page_id = None
-        if len(self.memory['titles']) == 0:
+        if len(self.page_titles) == 0:
             # get the seed page
             if seed_page_id is not None:
                 page = self.wiki.page(seed_page_id)
@@ -78,45 +76,45 @@ class WikiBot:
                                                access_token=twitter_api_keys[3],
                                                access_token_secret=twitter_api_keys[4])
         self.openai_client = OpenAI(api_key=openai_api_key, timeout=50.0)
-        self.encoder = tiktoken.encoding_for_model("gpt-3.5-turbo")
+        self.encoder = tiktoken.get_encoding("o200k_base")
 
     def get_id(self, title):
-        n = len(self.memory['titles'])
+        n = len(self.page_titles)
         slug_title = slugify(title)
         return f"exploration_{n}_{slug_title}"
 
-    def update_memory(self, this_id, title, page, date, tweet):
-        self.memory['titles'].append(title)
-        self.memory['pages'].append(page)
-        self.memory['ids'].append(this_id)
-        self.memory['tweets'].append(tweet)
-        self.memory['dates'].append(date)
-        self.save()
+    def update_memory(self, this_id, title, page, date, tweet, img_info, tweet_url):
+        new_mem = dict(title=title, page=page, id=this_id, tweets=tweet, date=date, img_info=img_info, tweet_url=tweet_url)
+        self.titles.append(title)
+        with open(self.memory_path, 'a') as file:
+            json_str = json.dumps(new_mem)
+            file.write(json_str + "\n")
 
     def generate_and_publish(self):
         new_date = self.get_date()
-        print(f'walk in wikipedia #{len(self.memory["titles"])}')
+        print(f'walk in wikipedia, step #{len(self.page_titles)}')
         print('  find wiki page')
         new_title, new_page = self.get_next_page()
         this_id = self.get_id(new_title)
         print(f'    found: {new_title}')
         print('  generate image')
         try:
-            new_img, new_img_path = self.generate_img(new_title, new_page, this_id)
-        except:
-            new_img, new_img_path = None, None
+            new_img_info = self.generate_img(new_title, new_page, this_id)
+        except Exception as err:
+            print(f'    error in img generation: {str(err)}')
+            new_img_info = None
         print('  generate tweet')
         new_tweets = self.format_tweet(new_title, new_page)
         print('  publish tweet')
-        self.publish(new_tweets, new_img_path)
+        tweet_url = self.publish(new_tweets, new_img_info)
         print('  save result')
-        self.update_memory(this_id, new_title, new_page, new_date, new_tweets)
+        self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
         stop = 1
 
 
 
     def get_next_page(self):
-        last_page_index = len(self.memory['titles']) - 1
+        last_page_index = len(self.page_titles) - 1
         new_page = None
         while last_page_index >= -1:
             success, new_page = self.get_new_page(last_page_index)
@@ -124,16 +122,16 @@ class WikiBot:
                 break
             else:
                 # go back one page to find valid page ids
-                print('going back one page')
+                print('    no new page here, going back one page')
                 last_page_index -= 1
-        assert  new_page is not None
+        assert new_page is not None
         return new_page.displaytitle, new_page
 
     def get_new_page(self, last_page_index):
         if last_page_index == -1:
             last_page_id = self.last_page_id
         else:
-            last_page_id = self.memory['titles'][last_page_index]
+            last_page_id = self.page_titles[last_page_index]
         if last_page_id is None:
             assert False, 'could not find new valid page ids'
         last_page = self.wiki.page(last_page_id)
@@ -150,7 +148,7 @@ class WikiBot:
             candidate_page = links[list_keys[k]]
             if candidate_page.exists():
                 # check that it has not been selected yet
-                if candidate_keyword in self.memory['titles']:
+                if candidate_keyword in self.page_titles:
                     continue
 
                 # check that it does not contain unwanted substring
@@ -173,49 +171,77 @@ class WikiBot:
 
     def crop_prompt(self, prompt, n_tokens):
         tokens = self.encoder.encode(prompt)
-        return self.encoder.decode(tokens[:n_tokens])
+        cropped_text = self.encoder.decode(tokens[:n_tokens])
+        if len(tokens) > n_tokens:
+            cropped_text += ' [...]'
+        return cropped_text
 
     def generate_img(self, new_title, new_page, this_id):
-        first_paragraph = self.crop_prompt(new_page.text.split('\n\n')[0], n_tokens=2000)
+        if 'img' in SKIP:
+            return None
+        first_two_paragraphs = new_page.text.split('\n\n')[:2]
+        first_paragraph = self.crop_prompt('\n\n'.join(first_two_paragraphs), n_tokens=2000)
 
         new_title = clean_title(new_title)
 
         # get a prompt
-        system_prompt = ("You are a creative AI assistant who takes a wikipedia page title and first paragraph and returns a very dense anc concise prompt for an AI image "
-                         "generator. The resulting generated image should be creative and appealing but capture essential components of the wikipedia concept such that we can "
-                         "recognize it.")
-        prompt = f"The title is: {new_title}. The first paragraph is:\n{first_paragraph}\n\nPrompt for an AI image generator:"
+        system_prompt = """You are a creative AI assistant who takes a wikipedia page title and the beginning of the page and returns a concise prompt for an AI image generator to illustrate the concept or topic.
+        
+Guidelines:
+- The prompt should be short (two sentences max)
+- The resulting generated image should be creative and appealing while capturing essential components of the wikipedia concept such that we can recognize it from the picture
+- If the topic is sensitive, make sure to craft a prompt that will not be censored, maybe try to draw something related without using the bad keywords"""
+        prompt = f"The title is: {new_title}. The beginning of the page is:\n{first_paragraph}\n\nPrompt for an AI image generator:"
         messages = [{"role": "system",
                      "content": system_prompt},
                     {"role": "user",
                      "content": prompt}]
-        image_prompt = self.call_text_model(messages)
-        image_url = self.call_image_model(image_prompt)
+        image_prompt = self.call_text_model(messages, self.params['text_model'], max_tokens=200)
+        print('    img prompt generated')
+        image_url = self.call_image_model(image_prompt, self.params['img_model'])
+        print('    image generated')
         image = download_image(image_url)
         img_path = self.img_path + f'{this_id}.png'
         img = Image.fromarray(image)
         img.save(img_path)
-        return image, img_path
+        img_info = dict(prompt=image_prompt, path=img_path)
+        return img_info
 
     def format_tweet(self, new_title, new_page, tweet_limit=280):
+        if 'tweet' in SKIP:
+            return None
         text = self.crop_prompt(new_page.text, n_tokens=2000)
 
         new_title = clean_title(new_title)
 
         # get a prompt
-        system_prompt = ("You are a creative AI assistant who takes a wikipedia page title and the beginning of its text and writes a thread of 2-3 engaging tweets with emojis."
-                         " Each tweet should be maximum 200 characters long and the tweets must be separated by two line breaks \\n\\n. Do not indicate tweet numbers. Write "
-                         "without capitalizing words, including at the beginning of sentences, but capitalize them when they are acronyms.")
-        prompt = f"The title is: {new_title}. The text is:\n{text}\n\nYour tweets:\nToday's page is about {new_title}! "
+        system_prompt = f"""You are a creative AI assistant who takes a wikipedia page title and the beginning of its text and writes a short thread of 3-5 engaging tweets on the topic to inform people in a fun way.
+
+Guidelines:
+- Tweets should be engaging, use emojis to illustrate concepts, or crack a joke sometimes (not always)
+- Be critical, be subjective, be edgy (but not rude)
+- Highlight interesting facts instead of boilerplates, engage people!
+- Start your tweet with something like: "today we're learning about topic X", or "today we're exploring the concept X" to introduce the subject.
+
+
+Formatting Rules:
+- Each tweet should be maximum 280 characters long
+- Tweets must be separated by markdown separators \\n***\\n
+- Do not indicate tweet numbers. 
+- Write without capitalizing words, including at the beginning of sentences, but capitalize them when they are acronyms."""
+        prompt = f"Today's title is: {new_title}. The text is:\n{text}"
         messages = [{"role": "system",
                      "content": system_prompt},
                     {"role": "user",
                      "content": prompt}]
-        tweets = self.call_text_model(messages)
-        tweets = f"Today's page is about {new_title}! " + tweets + f'\nlearn more: {new_page.fullurl}'
-        tweets = tweets.split('\n\n')
+        tweets = self.call_text_model(messages, self.params['text_model'], max_tokens=500)
+        tweets = tweets + f'\nlearn more: {new_page.fullurl}'
+
+        # First split by intended tweet boundaries
+        intended_tweets = tweets.split('***')
+
         reshaped_tweets = []
-        for t in tweets:
+        for t in intended_tweets:
             if len(t) < tweet_limit:
                 reshaped_tweets.append(t)
             else:
@@ -255,18 +281,22 @@ class WikiBot:
         for t in reshaped_tweets:
             assert len(t) < tweet_limit
 
+
+        print(f'    generated {len(reshaped_tweets)} tweets')
         return reshaped_tweets
 
-    def publish(self, tweets, new_img_path):
-        if len(tweets) > 6:
-            tweets = tweets[:6]
+    def publish(self, tweets, new_img_info):
+        if 'publish' in SKIP:
+            return None
+        tweets = tweets[:10]
 
-        if new_img_path is not None:
-            media = self.twitter_client_v1.media_upload(filename=new_img_path)
+        if new_img_info is not None:
+            media = self.twitter_client_v1.media_upload(filename=new_img_info['path'])
             media_id = media.media_id
         else:
             media_id = None
         previous_tweet_id = None
+        tweet_url = None
         for tweet in tweets:
             if previous_tweet_id is not None:
                 new_tweet = self.twitter_client_v2.create_tweet(text=tweet, in_reply_to_tweet_id=previous_tweet_id)
@@ -276,15 +306,9 @@ class WikiBot:
                 else:
                     new_tweet = self.twitter_client_v2.create_tweet(text=tweet)
             previous_tweet_id = new_tweet.data['id']
-
-    def save(self):
-        # copy prev first
-        if os.path.exists(self.memory_path):
-            copy(self.memory_path, self.memory_path + '.copy')
-        with open(self.memory_path, 'wb') as f:
-            pickle.dump(self.memory_path, f)
-        if os.path.exists(self.memory_path + '.copy'):
-            os.remove(self.memory_path + '.copy')
+            if tweet_url is None:
+                tweet_url = f"https://x.com/wiki_voyager/status/{previous_tweet_id}"
+        return tweet_url
 
     def get_date(self):
         # Get the current date
@@ -299,33 +323,57 @@ class WikiBot:
         formatted_date = f"{month} {day}{get_ordinal_suffix(day)} {year}"
         return formatted_date
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(20))
-    def call_text_model(self, messages, model="gpt-3.5-turbo"):
-        response = self.openai_client.chat.completions.create(model=model,
-                                                              messages=messages,
-                                                              max_tokens=200)
+    def call_text_model(self, messages, model="gpt-4o-mini-2024-07-18", max_tokens=1000):
+        i_attempt = 0
+        response = None
+        error = ""
+        while i_attempt < 5:
+            i_attempt += 1
+            try:
+                response = self.openai_client.chat.completions.create(model=model,
+                                                                      messages=messages,
+                                                                      max_tokens=max_tokens)
+                break
+            except Exception as err:
+                error = str(err)
+                print(f'API error: {str(err)}')
+                time.sleep(np.random.randint(5, 60))
+                
+        if response is None:
+            assert False, f"error in text model call: ERR: {error}"
         return response.choices[0].message.content
 
-    @retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(20))
-    def call_image_model(self, prompt, model='dall-e-3', size="1024x1024", quality='standard'):
+    def call_image_model(self, prompt, model='dall-e-3', size="1024x1024", quality='standard'):  # 4 cts
+        i_attempt = 0
+        response = None
+        error = ""
+        while i_attempt < 5:
+            i_attempt += 1
+            try:
+                response = self.openai_client.images.generate(model=model,
+                                                              prompt=prompt,
+                                                              n=1,
+                                                              size=size,
+                                                              quality=quality)
+                break
+            except Exception as err:
+                error = str(err)
+                print(f'API error: {str(err)}')
+                time.sleep(np.random.randint(5, 60))
 
-        response = self.openai_client.images.generate(model=model,
-                                                      prompt=prompt,
-                                                      n=1,
-                                                      size=size,
-                                                      quality=quality)
-
+        if response is None:
+            assert False, f"error in img model call: ERR: {error}"
         return response.data[0].url
 
 
 
 # utils
 def clean_title(new_title):
-    if '<i>' in new_title:
-        new_title = new_title.replace('<i>', '')
-    if '</i>' in new_title:
-        new_title = new_title.replace('</i>', '')
+    for c in ['<i>', '<b>', '</i>', '</b>']:
+        new_title = new_title.replace(c, '')
+    new_title = new_title.replace("&amp;", "&")
     return new_title
+
 def slugify(text):
     # Convert to lowercase
     text = text.lower()
@@ -349,12 +397,10 @@ def download_image(url):
     if response.status_code == 200:
         image = Image.open(BytesIO(response.content))
         image_array = np.array(image)
-        # Open a file in binary write mode
+        print('    image downloaded')
         return image_array
     else:
-        assert False
-        # print(f"Image downloaded successfully: {file_path}")
-        # print(f"Failed to download image. Status code: {response.status_code}")
+        assert False, "Failed to download image. Status code: {response.status_code}"
 
 
 if __name__ == '__main__':
