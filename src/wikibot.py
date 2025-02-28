@@ -1,365 +1,399 @@
+"""
+Main WikiBot class for exploring Wikipedia and publishing content.
+"""
 import os
-from datetime import datetime
-import re
-import time
 import json
-import requests
-
-from openai import OpenAI
-import wikipediaapi
-import wikipedia
-from PIL import Image
-from io import BytesIO
+import time
 import numpy as np
-import tiktoken
-import tweepy
+import wikipedia
+from utils import get_formatted_date, slugify, clean_title, format_tweet
+from clients import APIClients
+from content import ContentGenerator
 
-from tweet_splitter import split_tweets
-
-project_path = "/mnt/e85692fd-9cbc-4a8d-b5c5-9252bd9a34fd/Perso/Scratch/wikibot/"
-params = dict(unwanted_strings=['wiki','Wiki','Category', 'List', 'Template', 'Help', 'ISO', 'User','Talk','Portal'], text_model="gpt-4o-mini-2024-07-18", img_model="dall-e-3")
-handle = "@wiki_voyager"
-SKIP = ['tweet', 'publish', 'img']
-
-with open(project_path + '.api_openai', 'r') as f:
-    openai_api_key = f.read()
-
-with open(project_path + '.api_twitter', 'r') as f:
-    twitter_api_keys = f.read().split('\n')
-# order: api, api secret, bearer, access, access secret
 
 class WikiBot:
-    def __init__(self, name, seed_page_id='Wikipedia', params=params):
+    """
+    Bot for exploring Wikipedia and publishing content to Twitter.
+    """
+
+    def __init__(self, name, project_path, openai_api_key, twitter_api_keys,
+                 seed_page_id='Exploration', params=None):
+        """
+        Initialize the WikiBot.
+
+        Args:
+            name (str): Bot name for data directory
+            project_path (str): Base project path
+            openai_api_key (str): OpenAI API key
+            twitter_api_keys (list): Twitter API keys
+            seed_page_id (str): Wikipedia page ID to start from
+            params (dict): Configuration parameters
+        """
+        # Default configuration
         self.params = params
-        self.bot_path = project_path + 'data/' + name + '/'
-        self.img_path = self.bot_path + 'imgs/'
-        self.memory_path = self.bot_path + 'memory.jsonl'
+        # Setup paths
+        self.bot_path = os.path.join(project_path, 'data', name)
+        self.img_path = os.path.join(self.bot_path, 'imgs') + '/'
+        self.memory_path = os.path.join(self.bot_path, 'memory.jsonl')
+        self.params['img_path'] = self.img_path
+        self.params['project_path'] = project_path 
+
         os.makedirs(self.bot_path, exist_ok=True)
         os.makedirs(self.img_path, exist_ok=True)
 
-        self.page_titles = []
+        # Initialize API clients
+        self.clients = APIClients(project_path, openai_api_key, twitter_api_keys)
+
+        # Initialize content generator
+        self.content_generator = ContentGenerator(self.clients, self.params)
+
+        # Load memory
+        self.memories = []
         if os.path.exists(self.memory_path):
             with open(self.memory_path, "r") as file:
-                # Read each line and parse it as JSON
                 for line in file:
                     datapoint = json.loads(line.strip())
-                    self.page_titles.append(datapoint['title'])
+                    self.memories.append(datapoint)
 
-        self.setup_apis()
-
-        self.last_page_id = None
-        if len(self.page_titles) == 0:
-            # get the seed page
+        # Initialize starting page
+        self.last_title = None
+        if len(self.memories) == 0:
+            # Get the seed page
             if seed_page_id is not None:
-                page = self.wiki.page(seed_page_id)
+                page = self.clients.wiki.page(seed_page_id)
                 if page.exists():
-                    self.last_page_id = seed_page_id
+                    self.last_title = seed_page_id
 
-            if self.last_page_id is None:
-                self.last_page_id = wikipedia.random(1)
-                page = self.wiki.page(self.last_page_id)
+            if self.last_title is None:
+                self.last_title = wikipedia.random(1)
+                page = self.clients.wiki.page(self.last_title)
                 assert page.exists()
-            last_page_title = self.last_page_id
+            last_title = self.last_title
         else:
-            last_page_title = self.page_titles[-1]
-        print(f'start random walk from {last_page_title}')
+            last_title = self.memories[-1]['title']
+        print(f'Start random walk from {last_title}')
+
+    def generate_and_publish(self):
+        """
+        Main function to generate and publish content.
+
+        Args:
+            skip (list): List of steps to skip ('tweet', 'img', 'publish')
+
+        Returns:
+            dict: Information about the generated content
+        """
+
+        # Get date
+        new_date = get_formatted_date()
+
+        # Find new page
+        print('  searching for new page', end='\r')
+        new_title, new_page = self.get_next_page(self.params['n_link_options'])
+        this_id = self.get_id(new_title)
+        print(f'  step #{len(self.memories)+1}: {new_title}')
+
+        # Generate tweet
+        print('    generating tweet', end='\r')
+        new_tweets = self.content_generator.generate_tweet(new_title, new_page, self.memories)
+        print(f"# Today's tweet:\n\n{format_tweet(new_tweets)}\n\n")
+        # Generate image
+        print('    generating image', end='\r')
+        new_img_info = self.content_generator.generate_image(new_title, new_page, this_id, new_tweets)
+        print(f"# Today's image prompt:\n{new_img_info['prompt']}\n# Today's image url: {new_img_info['url']}\n")
+
+        # Publish content
+        print('    publishing tweet', end='\r')
+        tweet_url = self.publish(new_tweets, new_img_info)
+
+        # Save to memory
+        memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
+
+        return memory
 
     def update_memory(self, this_id, title, page, date, tweet, img_info, tweet_url):
-        new_mem = dict(title=title, url=page.fullurl, id=this_id, tweets=tweet, date=date, img_info=img_info, tweet_url=tweet_url)
-        self.page_titles.append(title)
+        """
+        Update bot memory with new content.
+
+        Args:
+            this_id (str): Page ID
+            title (str): Page title
+            page: Wikipedia page object
+            date (str): Formatted date
+            tweet (list): List of tweets
+            img_info (dict): Image information
+            tweet_url (str): URL to the published tweet
+        """
+        new_mem = {
+            'title': title,
+            'search_title': page.title,
+            'summary': self.get_summary(page),
+            'url': page.fullurl,
+            'id': this_id,
+            'tweets': tweet,
+            'date': date,
+            'img_info': img_info,
+            'tweet_url': tweet_url
+        }
+
+        self.memories.append(new_mem)
+
         with open(self.memory_path, 'a') as file:
             json_str = json.dumps(new_mem)
             file.write(json_str + "\n")
+        return new_mem
 
-    def generate_and_publish(self):
-        new_date = self.get_date()
-        print('  find wiki page', end='\r')
-        new_title, new_page = self.get_next_page()
-        this_id = self.get_id(new_title)
-        print(f'  step #{len(self.page_titles)}: {new_title}')
-        print('    generate image', end='\r')
-        new_img_info = self.generate_img(new_title, new_page, this_id)
-        print('    generate tweet', end='\r')
-        new_tweets = self.format_tweet(new_title, new_page)
-        print('    publish tweet', end='\r')
-        tweet_url = self.publish(new_tweets, new_img_info)
-        self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
-        stop = 1
+    def publish(self, tweets, img_info):
+        """
+        Publish tweets and image to Twitter.
 
-    def generate_img(self, new_title, new_page, this_id):
-        if 'img' in SKIP:
+        Args:
+            tweets (list): List of tweets to publish
+            img_info (dict): Image information
+
+        Returns:
+            str: URL to the published tweet
+        """
+        if tweets is None or 'publish' in self.params['to_skip']:
             return None
-        try:
-            summary = self.crop_prompt(new_page.summary, n_tokens=2000)
-    
-            new_title = clean_title(new_title)
-    
-            # get a prompt
-            system_prompt = """You are a creative AI assistant who takes a wikipedia page title and the beginning of the page and returns a concise prompt for an AI image generator to illustrate the concept or topic.
-            
-    Guidelines:
-    - The prompt should be short (two sentences max)
-    - The resulting generated image should be creative and appealing while capturing essential components of the wikipedia concept such that we can recognize it from the picture
-    - If the topic is sensitive, make sure to craft a prompt that will not be censored, maybe try to draw something related without using the bad keywords"""
-            prompt = f"The title is: {new_title}. The beginning of the page is:\n{summary}\n\nPrompt for an AI image generator:"
-            messages = [{"role": "system",
-                         "content": system_prompt},
-                        {"role": "user",
-                         "content": prompt}]
-            image_prompt = self.call_text_model(messages, self.params['text_model'], max_tokens=200)
-            print('    img prompt generated')
-            image_url = self.call_image_model(image_prompt, self.params['img_model'])
-            print('    image generated')
-            image = download_image(image_url)
-            img_path = self.img_path + f'{this_id}.png'
-            img = Image.fromarray(image)
-            img.save(img_path)
-            img_info = dict(prompt=image_prompt, path=img_path)
-            return img_info
-        except Exception as err:
-            print(f'    error in img generation: {str(err)}')
-            return None
-            
-    def format_tweet(self, new_title, new_page, tweet_limit=280):
-        if 'tweet' in SKIP:
-            return None
-        text = self.crop_prompt(new_page.text, n_tokens=2000)
 
-        new_title = clean_title(new_title)
+        tweets = tweets[:15]  # Limit to 15 tweets
 
-        # get a prompt
-        system_prompt = f"""You are a creative AI assistant who takes a wikipedia page title and the beginning of its text and writes a short thread of 3-5 engaging tweets on the topic to inform people in a fun way.
-
-Guidelines:
-- Tweets should be engaging, but in a cool way: don't use too much emoji, don't overdo the hashtags
-- Be critical, be subjective, be edgy (but not rude)
-- Highlight interesting facts instead of boilerplates, engage people!
-- Start your tweet by mentioning the topic of the day.
-
-Formatting Rules:
-- Each tweet should be maximum 280 characters long
-- Tweets must be separated by markdown separators \\n***\\n
-- Do not indicate tweet numbers. 
-- Write without capitalizing words, including at the beginning of sentences, but capitalize them when they are acronyms."""
-        prompt = f"Today's title is: {new_title}. The text is:\n{text}"
-        messages = [{"role": "system",
-                     "content": system_prompt},
-                    {"role": "user",
-                     "content": prompt}]
-        text = self.call_text_model(messages, self.params['text_model'], max_tokens=500)
-        text = text + f'\nlearn more: {new_page.fullurl}'
-        tweets = split_tweets(text)
-        for t in tweets:
-            assert len(t) < tweet_limit
-        print(f'    generated {len(tweets)} tweets')
-        return tweets
-
-    def publish(self, tweets, new_img_info):
-        if 'publish' in SKIP:
-            return None
-        tweets = tweets[:10]
-
-        if new_img_info is not None:
-            media = self.twitter_client_v1.media_upload(filename=new_img_info['path'])
+        # Upload media if available
+        media_id = None
+        if img_info is not None:
+            media = self.clients.twitter_client_v1.media_upload(filename=img_info['path'])
             media_id = media.media_id
-        else:
-            media_id = None
+
+        # Publish tweets
         previous_tweet_id = None
         tweet_url = None
+
         for tweet in tweets:
             if previous_tweet_id is not None:
-                new_tweet = self.twitter_client_v2.create_tweet(text=tweet, in_reply_to_tweet_id=previous_tweet_id)
+                new_tweet = self.clients.twitter_client_v2.create_tweet(
+                    text=tweet,
+                    in_reply_to_tweet_id=previous_tweet_id
+                )
             else:
                 if media_id is not None:
-                    new_tweet = self.twitter_client_v2.create_tweet(text=tweet, media_ids=[media_id])
+                    new_tweet = self.clients.twitter_client_v2.create_tweet(
+                        text=tweet,
+                        media_ids=[media_id]
+                    )
                 else:
-                    new_tweet = self.twitter_client_v2.create_tweet(text=tweet)
+                    new_tweet = self.clients.twitter_client_v2.create_tweet(
+                        text=tweet
+                    )
+
             previous_tweet_id = new_tweet.data['id']
+
             if tweet_url is None:
                 tweet_url = f"https://x.com/wiki_voyager/status/{previous_tweet_id}"
+
         return tweet_url
 
-    def get_date(self):
-        # Get the current date
-        now = datetime.now()
+    # Replace the existing get_next_page method in wikibot.py
 
-        # Extract the day, month, and year
-        day = now.day
-        month = now.strftime("%B")
-        year = now.year
+    def get_next_page(self, max_links=5):
+        """
+        Find the next Wikipedia page in the random walk using intelligent link selection.
 
-        # Format the date with the ordinal suffix
-        formatted_date = f"{month} {day}{get_ordinal_suffix(day)} {year}"
-        return formatted_date
+        Returns:
+            tuple: (page title, page object)
+        """
+        last_page_index = len(self.memories) - 1
 
-    def call_text_model(self, messages, model="gpt-4o-mini-2024-07-18", max_tokens=1000):
-        i_attempt = 0
-        response = None
-        error = ""
-        while i_attempt < 5:
-            i_attempt += 1
-            try:
-                response = self.openai_client.chat.completions.create(model=model,
-                                                                      messages=messages,
-                                                                      max_tokens=max_tokens)
-                break
-            except Exception as err:
-                error = str(err)
-                print(f'API error: {str(err)}')
-                time.sleep(np.random.randint(5, 60))
-                
-        if response is None:
-            assert False, f"error in text model call: ERR: {error}"
-        return response.choices[0].message.content
-
-    def call_image_model(self, prompt, model='dall-e-3', size="1024x1024", quality='standard'):  # 4 cts
-        i_attempt = 0
-        response = None
-        error = ""
-        while i_attempt < 5:
-            i_attempt += 1
-            try:
-                response = self.openai_client.images.generate(model=model,
-                                                              prompt=prompt,
-                                                              n=1,
-                                                              size=size,
-                                                              quality=quality)
-                break
-            except Exception as err:
-                error = str(err)
-                print(f'API error: {str(err)}')
-                time.sleep(np.random.randint(5, 60))
-
-        if response is None:
-            assert False, f"error in img model call: ERR: {error}"
-        return response.data[0].url
-
-    def get_next_page(self):
-        last_page_index = len(self.page_titles) - 1
-        new_page = None
         while last_page_index >= -1:
-            while True:
-                try:
-                    success, new_page = self.get_new_page(last_page_index)
-                    break
-                except:
-                    time.sleep(2)#np.random.randint(10, 3*60))
-                    print('    error in loading new page')
-            if success:
-                break
-            else:
-                # go back one page to find valid page ids
-                print('      no new page here, going back one page')
+            try:
+                # Get the current page
+                if last_page_index == -1:
+                    last_title = self.last_title
+                else:
+                    last_title = self.memories[last_page_index]['search_title']
+
+                current_page = self.clients.get_page(last_title)
+                links = current_page.links
+
+                # Filter out already visited pages and unwanted pages
+                filtered_links = []
+                linked_pages = list(links.values())
+                np.random.shuffle(linked_pages)
+                for linked_page in linked_pages:
+                    if linked_page.title not in filtered_links:
+                        link = self.get_link(linked_page)
+                        if link is not None:
+                            filtered_links.append(link)
+                        if len(filtered_links) > max_links:
+                            break
+                                
+                if len(filtered_links) == 0:
+                    # No valid links found, go back one page
+                    print('      no valid links here, going back one page')
+                    last_page_index -= 1
+                    continue
+
+                # Rank the links
+                new_page = self.select_link(current_page, filtered_links)
+
+                # Check that the page has content
+                if new_page is None:
+                    print('      selected page does not exist, going back one page')
+                    last_page_index -= 1
+                    continue
+
+                title = clean_title(new_page.displaytitle)
+                return title, new_page
+
+            except Exception as e:
+                print(f'    error in finding next page: {str(e)}')
+                # Wait and try again or go back
+                time.sleep(2)
                 last_page_index -= 1
-        assert new_page is not None, "no new page found (weird)"
-        return new_page.displaytitle, new_page
 
-    def get_new_page(self, last_page_index):
-        if last_page_index == -1:
-            last_page_id = self.last_page_id
+        raise RuntimeError("No new page found after exhausting all options")
+
+    def get_link(self, page):
+        title = page.title
+
+        # Skip already visited pages
+        if title in [m['search_title'] for m in self.memories]:
+            return None
+
+        # Skip unwanted pages
+        for unwanted in self.params['unwanted_strings']:
+            if unwanted in title:
+                return None
+
+        # Check if page exists
+        if not self.clients.page_exists(page) or not page.summary:
+            return None
+
+        link = {'summary': self.get_summary(page), 'title': page.displaytitle, 'url': page.fullurl, 'page_obj': page}
+        return link
+
+
+
+    def select_link(self, current_page, filtered_links):
+        """
+        Use LLM to rank links by interest and relevance.
+
+        Args:
+            current_page: Current Wikipedia page
+            link_contexts (list): List of link titles with their summaries
+
+        Returns:
+            list: Ranked list of link titles with reasoning
+        """
+        if len(filtered_links) == 1:
+            return filtered_links[0]['page_obj']
+
+
+        # Build the prompt
+        system_prompt = (
+            "You are an AI agent on a journey through Wikipedia, moving each day from one page to the next by following interesting links, never reading the same page twice."
+            "Given a set of links and recent exploration trajectories, your task is to rank available links as a function of your interest in exploring them next."
+        )
+
+        user_prompt = (f"# Context\n\n"
+                       f"## Yesterday's page\n\n{current_page.displaytitle}: {current_page.summary[:200]}...\n\n")
+
+        if len(self.memories) > 0:
+            user_prompt += f"## Yesterday's thread:\n\n{format_tweet(self.memories[-1]['tweets'])}\n\n"
+            user_prompt += "## Earlier pages (most recent first)\n"
+            for i, memory in enumerate(reversed(self.memories[-self.params['context_length']:])):
+                user_prompt += f"{i + 1}. {memory['title']}: {memory['summary']}\n"
+            user_prompt += "\n"
+
+        user_prompt += "# Available links to explore\n"
+        for i, link in enumerate(filtered_links):
+            user_prompt += f"{i + 1}. <title>{link['title']}</title> {link['summary']}\n\n"
+
+        user_prompt += (
+            "\nTASK:\nPlease rank the top 5 most interesting links to explore next. "
+            "For each link, provide a brief reason why it would be interesting to explore. "
+            "\nFormat your response as numbered list with the exact link title (same format, case, tags, etc) in <title></title> tags, followed by your reasoning:\n"
+            "1. <title>title 1</title> reasoning\n"
+            "2. <title><i>title 2</i></title> reasoning\n"
+            "...\n\n"
+        )
+
+        # Call the LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+           
+        response = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=500)
+
+        # Parse the response to extract ranked links
+        ranked_links = []
+        lines = response.split('\n')
+        current_link = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Look for numbered items
+            if line[0].isdigit() and '. ' in line:
+                parts = line.split('. ', 1)
+                if len(parts) >= 2:
+                    text = parts[1].strip('<title>')
+                    link_title = text.split('</title>', 1)[0] if '</title>' in text else text
+                    link_title = link_title.strip()
+
+                    # Check if this link exists in our context dict
+                    for link in filtered_links:
+                        title = link['title']
+                        if title.lower() == link_title.lower() or title.lower() in link_title.lower() or link_title.lower() in title.lower():
+                            current_link = {
+                                'title': title,
+                                'rank': int(parts[0]),
+                                'page_obj': link['page_obj']
+                            }
+                            ranked_links.append(current_link)
+                            break
+        # Sort by rank
+        ranked_links.sort(key=lambda x: x['rank'])
+
+        if not ranked_links:
+            # No ranked links, use fallback to random selection
+            print('      no ranked links, using random selection')
+            return filtered_links[np.random.choice(range(len(filtered_links)))]['page_obj']
         else:
-            last_page_id = self.page_titles[last_page_index]
-        if last_page_id is None:
-            assert False, 'could not find new valid page ids'
-        last_page = self.wiki.page(last_page_id)
-        links = last_page.links
-        list_keys = sorted(links.keys())
-        np.random.shuffle(list_keys)
-        n_keys = len(list_keys)
-        success = False
-        candidate_page = None
-        for k in range(n_keys):
-            # check for unwanted pages
-            reject = False  # reject current keyword if True
-            candidate_keyword = list_keys[k]
-            candidate_page = links[list_keys[k]]
-            if candidate_page.exists():
-                # check that it has not been selected yet
-                if candidate_keyword in self.page_titles:
-                    continue
+            # Use a weighted selection from the ranked links
+            # 70% chance of picking the top link, 30% chance of random from top 3
+            if np.random.random() < 0.7 or len(ranked_links) == 1:
+                # Pick the top-ranked link
+                selected_link = ranked_links[0]
+            else:
+                # Pick randomly from top 3 (or fewer if less available)
+                top_n = min(3, len(ranked_links))
+                selected_link = ranked_links[np.random.randint(0, top_n)]
+            new_page = selected_link['page_obj']
+        return new_page
 
-                # check that it does not contain unwanted substring
-                for strg in self.params['unwanted_strings']:
-                    if strg in candidate_keyword:
-                        reject = True
-                        break
-                if reject:
-                    continue
-
-                # check whether next page contains links
-                if len(sorted(candidate_page.links.keys())) < 1:
-                    continue
-
-                # page seems valid
-                success = True
-                break
-
-        return success, candidate_page
-
-    def crop_prompt(self, prompt, n_tokens):
-        tokens = self.encoder.encode(prompt)
-        cropped_text = self.encoder.decode(tokens[:n_tokens])
-        if len(tokens) > n_tokens:
-            cropped_text += ' [...]'
-        return cropped_text
-    
-    def setup_apis(self):
-        self.wiki = wikipediaapi.Wikipedia(language='en',
-                                           user_agent='my_app/0.1 (my_email@example.com)'
-                                           )
-
-        # setup api v1 to upload media
-        auth = tweepy.OAuth1UserHandler(twitter_api_keys[0], twitter_api_keys[1], twitter_api_keys[3], twitter_api_keys[4])
-        self.twitter_client_v1 = tweepy.API(auth)
-
-        # setup api v2 to tweet
-        self.twitter_client_v2 = tweepy.Client(consumer_key=twitter_api_keys[0],
-                                               consumer_secret=twitter_api_keys[1],
-                                               access_token=twitter_api_keys[3],
-                                               access_token_secret=twitter_api_keys[4])
-        self.openai_client = OpenAI(api_key=openai_api_key, timeout=50.0)
-        self.encoder = tiktoken.get_encoding("o200k_base")
+    def get_summary(self, page):
+        summary = page.summary.split('. ')
+        if len(summary) >= 2:
+            short_summary = '. '.join(summary[:2]) + '.'
+        else:
+            short_summary = page.summary[:150] + ('...' if len(page.summary) > 150 else '')
+        return short_summary
 
     def get_id(self, title):
-        n = len(self.page_titles)
+        """
+        Generate a unique ID for a page.
+
+        Args:
+            title (str): Page title
+
+        Returns:
+            str: Unique ID
+        """
+        n = len(self.memories)
         slug_title = slugify(title)
         return f"exploration_{n}_{slug_title}"
-
-
-# utils
-def clean_title(new_title):
-    for c in ['<i>', '<b>', '</i>', '</b>']:
-        new_title = new_title.replace(c, '')
-    new_title = new_title.replace("&amp;", "&")
-    return new_title
-
-def slugify(text):
-    # Convert to lowercase
-    text = text.lower()
-    # Replace non-word (word here means [a-zA-Z0-9_]) characters with a hyphen
-    text = re.sub(r'\W+', '-', text)
-    # Trim hyphens from the start and end
-    text = text.strip('-')
-    return text
-
-def get_ordinal_suffix(day):
-    if 4 <= day <= 20 or 24 <= day <= 30:
-        return "th"
-    else:
-        return ["st", "nd", "rd"][day % 10 - 1]
-
-def download_image(url):
-    # Send a GET request to the URL
-    response = requests.get(url, stream=True)
-
-    # Check if the request was successful
-    if response.status_code == 200:
-        image = Image.open(BytesIO(response.content))
-        image_array = np.array(image)
-        print('    image downloaded')
-        return image_array
-    else:
-        assert False, "Failed to download image. Status code: {response.status_code}"
-
-
-

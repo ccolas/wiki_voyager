@@ -3,6 +3,6 @@ pillow
 openai
 wikipedia-api
 wikipedia
-tenacity
+pydantic
 tiktoken
 tweepy
