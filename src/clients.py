@@ -53,7 +53,7 @@ class APIClients:
     def print_costs(self):
         total_cost = self.img_count * 0.04 + self.input_tokens / 1e6 * 0.15 + self.output_tokens / 1e6 * 0.60
         cost_per_day = total_cost / self.img_count
-        print(f'costs: {total_cost}, {cost_per_day}/day')
+        print(f'costs: USD {total_cost:.2f}, USD {cost_per_day*100:.2f}cts /day')
 
     def _setup_wikipedia(self):
         """Set up Wikipedia API client."""

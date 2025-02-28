@@ -134,6 +134,5 @@ class ContentGenerator:
         for t in tweets:
             assert len(t) < tweet_limit, f"Tweet exceeds limit: {len(t)} > {tweet_limit}"
 
-        print(f'    generated {len(tweets)} tweets')
         return tweets
 

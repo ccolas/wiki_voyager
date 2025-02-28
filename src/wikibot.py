@@ -108,6 +108,7 @@ class WikiBot:
 
         # Save to memory
         memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
+        self.clients.print_costs()
 
         return memory
 

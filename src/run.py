@@ -39,7 +39,7 @@ if __name__ == '__main__':
     openai_api_key, twitter_api_keys = read_api_keys(project_path)
 
     # Bot configuration
-    bot_name = 'bot2'
+    bot_name = 'trail_1'
     bot_path = os.path.join(project_path, 'data', bot_name)
     last_bot_path = os.path.join(bot_path, 'last_run.json')
 
@@ -81,7 +81,7 @@ if __name__ == '__main__':
                 with open(last_bot_path, 'w') as f:
                     json.dump(last_run, f)
 
-                print(f"WikiBot run completed successfully at {datetime.now()}")
+                # print(f"WikiBot run completed successfully at {datetime.now()}")
 
                 # Wait between 1-2.5 hours before checking again
                 # time.sleep(np.random.randint(3600, 9000))
