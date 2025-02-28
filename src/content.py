@@ -132,7 +132,7 @@ class ContentGenerator:
 
         # Validate tweet lengths
         for t in tweets:
-            assert len(t) < tweet_limit, f"Tweet exceeds limit: {len(t)} > {tweet_limit}"
+            assert len(t) <= tweet_limit, f"Tweet exceeds limit: {len(t)} > {tweet_limit}"
 
         return tweets
 

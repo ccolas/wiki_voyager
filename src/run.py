@@ -56,7 +56,11 @@ if __name__ == '__main__':
     )
 
     # Main loop
+    i_attempt = 0
     while True:
+        i_attempt += 1
+        if i_attempt > 10:
+            break
         # Check last run date
         if os.path.exists(last_bot_path):
             with open(last_bot_path, 'r') as f:

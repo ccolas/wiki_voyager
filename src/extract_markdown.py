@@ -111,15 +111,6 @@ def generate_markdown(dir):
     return markdown_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Convert WikiBot memory.jsonl to markdown')
-    parser.add_argument('--memory', required=True, help='Path to memory.jsonl file')
-    parser.add_argument('--output', required=True, help='Output directory for markdown and images')
-
-    args = parser.parse_args()
-
-
-
 
 if __name__ == "__main__":
     dir = "/mnt/e85692fd-9cbc-4a8d-b5c5-9252bd9a34fd/Perso/Scratch/wikibot/data/trail_1/"
