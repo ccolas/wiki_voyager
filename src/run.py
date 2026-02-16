@@ -1,14 +1,19 @@
 """
 Run script for WikiBot - executes the bot on a daily schedule.
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import json
 import time
 import numpy as np
+import zoneinfo
 
 from wikibot import WikiBot
 
+DEBUG = True
+PUBLISH = False
+POST_HOUR = 19  # 7pm Paris time
+TIMEZONE = zoneinfo.ZoneInfo("Europe/Paris")
 
 def read_api_keys(project_path):
     """Read API keys from files."""
@@ -24,10 +29,11 @@ PARAMS = {
     'unwanted_strings': ['wiki', 'Wiki', 'Category', 'List', 'Template',
                          'Help', 'ISO', 'User', 'Talk', 'Portal', '501'],
     'text_model': "gpt-4o-mini-2024-07-18",
-    'img_model': "dall-e-3",
+    'img_model': "gpt-image-1-mini",
     'to_skip': ['publish'],
     'context_length': 10,
-    'n_link_options': 19
+    'n_link_options': 19,
+    'debug': DEBUG
 }
 
 if __name__ == '__main__':
@@ -55,45 +61,61 @@ if __name__ == '__main__':
         params=PARAMS
     )
 
-    # Main loop
-    i_attempt = 0
-    while True:
-        i_attempt += 1
-        if i_attempt > 10:
-            break
-        # Check last run date
-        if os.path.exists(last_bot_path):
-            with open(last_bot_path, 'r') as f:
-                last_run = json.load(f)
-            last_date = datetime(year=last_run['year'], month=last_run['month'], day=last_run['day'])
-        else:
-            last_date = datetime(year=1975, month=1, day=1)
+    def seconds_until_post():
+        """Compute seconds until next POST_HOUR in Paris time."""
+        now = datetime.now(TIMEZONE)
+        target = now.replace(hour=POST_HOUR, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        return (target - now).total_seconds()
 
-        now = datetime.now()
+    def already_posted_today():
+        """Check if the bot already posted today (Paris time)."""
+        if not os.path.exists(last_bot_path):
+            return False
+        with open(last_bot_path, 'r') as f:
+            last_run = json.load(f)
+        today = datetime.now(TIMEZONE).date()
+        last_date = datetime(year=last_run['year'], month=last_run['month'], day=last_run['day']).date()
+        return last_date >= today
 
-        # For testing purposes, remove the comment to run regardless of time
-        # In production, uncomment the time check
-        if True:  # (now - last_date).days > 1 and now.hour > 12:
-            print(f"Running WikiBot at {now}")
+    if DEBUG:
+        # Debug mode: run immediately, up to 10 steps
+        for i_step in range(10):
+            print(f"[debug] Running step {i_step + 1}")
+            try:
+                wikibot.generate_and_publish(publish=PUBLISH, debug=DEBUG)
+            except Exception as e:
+                print(f"Error: {e}")
+    else:
+        # Production: post once per day at POST_HOUR Paris time
+        while True:
+            if already_posted_today():
+                wait = seconds_until_post()
+                print(f"Already posted today. Sleeping {wait/3600:.1f}h until {POST_HOUR}:00 Paris time.")
+                time.sleep(wait)
+                continue
+
+            # Add a small random delay (0-30 min) so it doesn't post at exactly :00 every day
+            jitter = np.random.randint(0, 1800)
+            print(f"Posting in {jitter//60} minutes...")
+            time.sleep(jitter)
 
             try:
-                wikibot.generate_and_publish()
+                print(f"Running WikiBot at {datetime.now(TIMEZONE)}")
+                wikibot.generate_and_publish(publish=PUBLISH, debug=DEBUG)
 
-                # Update last run time
-                last_run = {'day': now.day, 'month': now.month, 'year': now.year}
-
+                # Save today's date
+                today = datetime.now(TIMEZONE)
+                last_run = {'day': today.day, 'month': today.month, 'year': today.year}
                 with open(last_bot_path, 'w') as f:
                     json.dump(last_run, f)
 
-                # print(f"WikiBot run completed successfully at {datetime.now()}")
-
-                # Wait between 1-2.5 hours before checking again
-                # time.sleep(np.random.randint(3600, 9000))
-
+                print(f"Done. Next post tomorrow at ~{POST_HOUR}:00 Paris time.")
             except Exception as e:
-                print(f"Error running WikiBot: {str(e)}")
-                # Wait 15 minutes before trying again on error
+                print(f"Error: {e}. Retrying in 15 minutes.")
                 time.sleep(900)
-        else:
-            # Check again in an hour
-            time.sleep(3600)
+                continue
+
+            # Sleep until tomorrow's post time
+            time.sleep(seconds_until_post())

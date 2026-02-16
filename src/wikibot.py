@@ -6,8 +6,9 @@ import json
 import time
 import numpy as np
 import wikipedia
+
 from utils import get_formatted_date, slugify, clean_title, format_tweet
-from clients import APIClients
+from clients import APIClients, ContentFilterError
 from content import ContentGenerator
 
 
@@ -73,44 +74,57 @@ class WikiBot:
             last_title = self.memories[-1]['title']
         print(f'Start random walk from {last_title}')
 
-    def generate_and_publish(self):
+    def generate_and_publish(self, publish=True, debug=False, max_retries=5):
         """
         Main function to generate and publish content.
-
-        Args:
-            skip (list): List of steps to skip ('tweet', 'img', 'publish')
+        Retries with a different page if content is filtered by the API.
 
         Returns:
             dict: Information about the generated content
         """
 
-        # Get date
         new_date = get_formatted_date()
+        filtered_titles = set()
 
-        # Find new page
-        print('  searching for new page', end='\r')
-        new_title, new_page = self.get_next_page(self.params['n_link_options'])
-        this_id = self.get_id(new_title)
-        print(f'  step #{len(self.memories)+1}: {new_title}')
+        for attempt in range(max_retries):
+            # Find new page (excluding filtered ones)
+            print('  searching for new page', end='\r')
+            new_title, new_page = self.get_next_page(self.params['n_link_options'], skip_titles=filtered_titles)
+            this_id = self.get_id(new_title)
+            print(f'  step #{len(self.memories)+1}: {new_title}')
 
-        # Generate tweet
-        print('    generating tweet', end='\r')
-        new_tweets = self.content_generator.generate_tweet(new_title, new_page, self.memories)
-        print(f"# Today's tweet:\n\n{format_tweet(new_tweets)}\n\n")
-        # Generate image
-        print('    generating image', end='\r')
-        new_img_info = self.content_generator.generate_image(new_title, new_page, this_id, new_tweets)
-        print(f"# Today's image prompt:\n{new_img_info['prompt']}\n# Today's image url: {new_img_info['url']}\n")
+            try:
+                # Generate tweet
+                print('    generating tweet', end='\r')
+                new_tweets = self.content_generator.generate_tweet(new_title, new_page, self.memories)
+                print(f"# Today's tweet:\n\n{format_tweet(new_tweets)}\n\n")
 
-        # Publish content
-        print('    publishing tweet', end='\r')
-        tweet_url = self.publish(new_tweets, new_img_info)
+                # Generate image
+                print('    generating image', end='\r')
+                new_img_info = self.content_generator.generate_image(new_title, new_page, this_id, new_tweets)
+                if new_img_info is not None:
+                    print(f"# Today's image prompt:\n{new_img_info['prompt']}\n# Today's image path: {new_img_info['path']}\n")
+                else:
+                    print("# No image generated (skipped)\n")
 
-        # Save to memory
-        memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
-        self.clients.print_costs()
+            except ContentFilterError as e:
+                print(f'    content filtered for "{new_title}", trying another page ({attempt+1}/{max_retries})')
+                filtered_titles.add(new_title)
+                continue
 
-        return memory
+            # Publish content
+            if publish and not debug:
+                print('    publishing tweet', end='\r')
+                tweet_url = self.publish(new_tweets, new_img_info)
+            else:
+                tweet_url = None
+
+            # Save to memory
+            memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
+            self.clients.print_costs()
+            return memory
+
+        raise RuntimeError(f"Failed after {max_retries} attempts due to content filtering")
 
     def update_memory(self, this_id, title, page, date, tweet, img_info, tweet_url):
         """
@@ -196,13 +210,20 @@ class WikiBot:
 
     # Replace the existing get_next_page method in wikibot.py
 
-    def get_next_page(self, max_links=5):
+    def get_next_page(self, max_links=5, skip_titles=None):
         """
         Find the next Wikipedia page in the random walk using intelligent link selection.
+
+        Args:
+            max_links (int): Max candidate links to consider per page
+            skip_titles (set): Titles to skip (e.g. previously filtered by content policy)
 
         Returns:
             tuple: (page title, page object)
         """
+        if skip_titles is None:
+            skip_titles = set()
+
         last_page_index = len(self.memories) - 1
 
         while last_page_index >= -1:
@@ -222,12 +243,12 @@ class WikiBot:
                 np.random.shuffle(linked_pages)
                 for linked_page in linked_pages:
                     if linked_page.title not in filtered_links:
-                        link = self.get_link(linked_page)
+                        link = self.get_link(linked_page, skip_titles)
                         if link is not None:
                             filtered_links.append(link)
                         if len(filtered_links) > max_links:
                             break
-                                
+
                 if len(filtered_links) == 0:
                     # No valid links found, go back one page
                     print('      no valid links here, going back one page')
@@ -254,11 +275,15 @@ class WikiBot:
 
         raise RuntimeError("No new page found after exhausting all options")
 
-    def get_link(self, page):
+    def get_link(self, page, skip_titles=None):
         title = page.title
 
         # Skip already visited pages
         if title in [m['search_title'] for m in self.memories]:
+            return None
+
+        # Skip content-filtered pages
+        if skip_titles and title in skip_titles:
             return None
 
         # Skip unwanted pages

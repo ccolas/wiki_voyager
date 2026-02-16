@@ -113,6 +113,9 @@ def generate_markdown(dir):
 
 
 if __name__ == "__main__":
-    dir = "/mnt/e85692fd-9cbc-4a8d-b5c5-9252bd9a34fd/Perso/Scratch/wikibot/data/trail_1/"
+    script_path = os.path.dirname(os.path.abspath(__file__))
+    project_path = os.path.dirname(script_path) + '/'
+
+    dir = os.path.join(project_path, "data/trail_1/")
     # Generate markdown
     generate_markdown(dir)

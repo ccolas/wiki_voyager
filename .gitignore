@@ -163,6 +163,7 @@ cython_debug/
 
 .api_openai
 .api_twitter
+.claude
 data/
 
 data/misc

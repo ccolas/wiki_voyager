@@ -2,12 +2,14 @@
 Content generation module for WikiBot (tweets and images).
 """
 import os
+import base64
 from PIL import Image
 from pydantic import BaseModel
 from typing import Optional
 
-from utils import download_image, format_tweet
+from utils import format_tweet
 from tweet_splitter import split_tweets
+from clients import ContentFilterError
 
 
 class PromptOrSearch(BaseModel):
@@ -33,6 +35,7 @@ class ContentGenerator:
         """
         self.clients = clients
         self.params = params
+        self.debug = params['debug']
 
     def generate_image(self, title, page, step_id, new_tweets):
         """
@@ -50,34 +53,31 @@ class ContentGenerator:
         if 'img' in self.params['to_skip']:
             return None
 
-        try:
-            # Prepare page content
-            summary = self.clients.crop_text(page.summary, n_tokens=2000)
+        # Build image prompt directly — no LLM call needed
+        summary_sentences = page.summary.split('. ')[:3]
+        short_summary = '. '.join(summary_sentences).strip()
+        if not short_summary.endswith('.'):
+            short_summary += '.'
 
-            # Read prompt from file
-            with open(self.params['project_path'] + "src/prompts/image_generation.txt", "r") as f:
-                system_prompt = f.read().strip()
+        style = (
+            "Risograph print style, 2-4 muted colors on warm cream paper, "
+            "subtle grain and halftone texture, clean minimal composition, "
+            "soft desaturated palette. No text, no letters, no words, no labels, no captions."
+        )
+        image_prompt = f"An illustration of: {title}.\n\nContext: {short_summary}\n\nStyle: {style}"
 
-            # Create user prompt
-            user_prompt = (f"The title is: {title}. The beginning of the page is:\n{summary}\n\n"
-                           f"Here the tweet you want to illustrate:\n{format_tweet(new_tweets)}\n\n"
-                           f"Please generate an image prompt for DALL-E that follows the guidelines.")
-            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        if self.debug:
+            print(f'Image prompt: {image_prompt}')
 
-            # Get image prompt from AI
-            image_prompt = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=200)
+        # Generate image (ContentFilterError propagates up)
+        image_b64 = self.clients.call_image_model(image_prompt, self.params['img_model'])
 
-            # Generate image using OpenAI API
-            image_url = self.clients.call_image_model(image_prompt, self.params['img_model'])
-
-            # Download and save the image
-            img_path = self.params['img_path'] + f'{step_id}.png'
-            download_image(image_url, img_path)
-            img_info = dict(prompt=image_prompt, url=image_url, path=img_path)
-            return img_info
-        except Exception as err:
-            print(f"Error in image generation: {str(err)}")
-            return None
+        # Save the image from base64
+        img_path = self.params['img_path'] + f'{step_id}.png'
+        with open(img_path, "wb") as f:
+            f.write(base64.b64decode(image_b64))
+        img_info = dict(prompt=image_prompt, path=img_path)
+        return img_info
 
     def generate_tweet(self, title, page, memories, tweet_limit=280):
         """
@@ -121,7 +121,11 @@ class ContentGenerator:
 
         # Call the model
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-
+        # if self.debug:
+        #     print('##########################\n'
+        #           'PROMPT FOR SUMMARIZER')
+        #     for m in messages:
+        #         print(f'\n\n{m["role"]}\n{m["content"]}')
         text = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=800)
 
         # Add Wikipedia URL to the end if not already included

@@ -9,6 +9,11 @@ import tweepy
 from openai import OpenAI
 import os
 
+
+class ContentFilterError(Exception):
+    """Raised when OpenAI refuses a request due to content policy."""
+    pass
+
 class APIClients:
     """
     Wrapper for all API clients used by WikiBot.
@@ -51,7 +56,7 @@ class APIClients:
             f.write(usage_txt)
 
     def print_costs(self):
-        total_cost = self.img_count * 0.04 + self.input_tokens / 1e6 * 0.15 + self.output_tokens / 1e6 * 0.60
+        total_cost = self.img_count * 0.02 + self.input_tokens / 1e6 * 0.15 + self.output_tokens / 1e6 * 0.60
         cost_per_day = total_cost / self.img_count
         print(f'costs: USD {total_cost:.2f}, USD {cost_per_day*100:.2f} cts/day')
 
@@ -117,13 +122,15 @@ class APIClients:
                 return output
             except Exception as err:
                 error = str(err)
-                print(f'API error: {str(err)}')
+                if 'content_policy' in error or 'content policy' in error.lower() or 'safety' in error.lower():
+                    raise ContentFilterError(f"Content filtered: {error}")
+                print(f'API error: {error}')
                 time.sleep(np.random.randint(5, 60))
 
         if response is None:
             raise RuntimeError(f"Error in text model call: {error}")
 
-    def call_image_model(self, prompt, model='dall-e-3', size="1024x1024", quality='standard'):
+    def call_image_model(self, prompt, model='gpt-image-1-mini', size="1024x1024", quality='low'):
         """
         Call OpenAI image model with retry logic.
 
@@ -131,10 +138,10 @@ class APIClients:
             prompt (str): Text prompt for image generation
             model (str): Model name to use
             size (str): Image size
-            quality (str): Image quality
+            quality (str): Image quality ('low', 'medium', 'high')
 
         Returns:
-            URL of the generated image
+            Base64-encoded image data (str)
         """
         i_attempt = 0
         response = None
@@ -154,13 +161,15 @@ class APIClients:
                 break
             except Exception as err:
                 error = str(err)
-                print(f'API error: {str(err)}')
+                if 'content_policy' in error or 'content policy' in error.lower() or 'safety' in error.lower():
+                    raise ContentFilterError(f"Content filtered: {error}")
+                print(f'API error: {error}')
                 time.sleep(np.random.randint(5, 60))
 
         if response is None:
             raise RuntimeError(f"Error in image model call: {error}")
         self.save_usage()
-        return response.data[0].url
+        return response.data[0].b64_json
 
     def get_page(self, title):
         i_attempts = 0
