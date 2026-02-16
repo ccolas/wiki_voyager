@@ -10,8 +10,8 @@ import zoneinfo
 
 from wikibot import WikiBot
 
-DEBUG = True
-PUBLISH = False
+DEBUG = False
+PUBLISH = True
 POST_HOUR = 19  # 7pm Paris time
 TIMEZONE = zoneinfo.ZoneInfo("Europe/Paris")
 
@@ -45,7 +45,7 @@ if __name__ == '__main__':
     openai_api_key, twitter_api_keys = read_api_keys(project_path)
 
     # Bot configuration
-    bot_name = 'trail_1'
+    bot_name = 'twitter_trail'
     bot_path = os.path.join(project_path, 'data', bot_name)
     last_bot_path = os.path.join(bot_path, 'last_run.json')
 
