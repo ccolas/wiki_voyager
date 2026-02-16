@@ -30,8 +30,8 @@ PARAMS = {
                          'Help', 'ISO', 'User', 'Talk', 'Portal', '501'],
     'text_model': "gpt-4o-mini-2024-07-18",
     'img_model': "gpt-image-1-mini",
-    'to_skip': ['publish'],
-    'context_length': 10,
+    'to_skip': [],
+    'context_length': 30,
     'n_link_options': 19,
     'debug': DEBUG
 }
@@ -81,20 +81,22 @@ if __name__ == '__main__':
 
     if DEBUG:
         # Debug mode: run immediately, up to 10 steps
-        for i_step in range(10):
+        for i_step in range(5):
             print(f"[debug] Running step {i_step + 1}")
             try:
                 wikibot.generate_and_publish(publish=PUBLISH, debug=DEBUG)
             except Exception as e:
                 print(f"Error: {e}")
     else:
-        # Production: post once per day at POST_HOUR Paris time
+        # Production: post immediately on first run, then daily at POST_HOUR
+        first_run = True
         while True:
-            if already_posted_today():
+            if not first_run and already_posted_today():
                 wait = seconds_until_post()
                 print(f"Already posted today. Sleeping {wait/3600:.1f}h until {POST_HOUR}:00 Paris time.")
                 time.sleep(wait)
                 continue
+            first_run = False
 
             # Add a small random delay (0-30 min) so it doesn't post at exactly :00 every day
             jitter = np.random.randint(0, 1800)

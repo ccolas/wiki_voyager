@@ -6,6 +6,8 @@ import numpy as np
 import tiktoken
 import wikipediaapi
 import tweepy
+from requests_oauthlib import OAuth1
+import requests
 from openai import OpenAI
 import os
 
@@ -34,7 +36,7 @@ class APIClients:
 
         # Initialize clients
         self.wiki = self._setup_wikipedia()
-        self.twitter_client_v1 = self._setup_twitter_v1()
+        self.twitter_auth = self._setup_twitter_auth()
         self.twitter_client_v2 = self._setup_twitter_v2()
         self.openai_client = self._setup_openai()
         self.encoder = tiktoken.get_encoding("o200k_base")
@@ -67,15 +69,47 @@ class APIClients:
             user_agent='WikiBot/1.0 (wiki_voyager)'
         )
 
-    def _setup_twitter_v1(self):
-        """Set up Twitter API v1 client (for media upload)."""
-        auth = tweepy.OAuth1UserHandler(
+    def _setup_twitter_auth(self):
+        """Set up OAuth1 auth for v2 media upload."""
+        return OAuth1(
             self.twitter_api_keys[0],
             self.twitter_api_keys[1],
             self.twitter_api_keys[3],
             self.twitter_api_keys[4]
         )
-        return tweepy.API(auth)
+
+    def upload_media(self, file_path):
+        """Upload media via Twitter API v2 (initialize → append → finalize)."""
+        auth = self.twitter_auth
+        base = "https://api.x.com/2/media/upload"
+
+        file_size = os.path.getsize(file_path)
+        mime = "image/png" if file_path.endswith(".png") else "image/jpeg"
+
+        # INIT
+        resp = requests.post(f"{base}/initialize", auth=auth, json={
+            "media_type": mime,
+            "total_bytes": file_size,
+            "media_category": "tweet_image"
+        })
+        resp.raise_for_status()
+        media_id = resp.json()["data"]["id"]
+
+        # APPEND
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                f"{base}/{media_id}/append",
+                auth=auth,
+                files={"media": f},
+                data={"segment_index": 0}
+            )
+            resp.raise_for_status()
+
+        # FINALIZE
+        resp = requests.post(f"{base}/{media_id}/finalize", auth=auth)
+        resp.raise_for_status()
+
+        return media_id
 
     def _setup_twitter_v2(self):
         """Set up Twitter API v2 client (for tweeting)."""

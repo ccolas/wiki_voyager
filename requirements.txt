@@ -6,3 +6,4 @@ wikipedia
 pydantic
 tiktoken
 tweepy
+requests-oauthlib

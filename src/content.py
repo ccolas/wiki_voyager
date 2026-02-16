@@ -66,8 +66,8 @@ class ContentGenerator:
         )
         image_prompt = f"An illustration of: {title}.\n\nContext: {short_summary}\n\nStyle: {style}"
 
-        if self.debug:
-            print(f'Image prompt: {image_prompt}')
+        # if self.debug:
+        #     print(f'Image prompt: {image_prompt}')
 
         # Generate image (ContentFilterError propagates up)
         image_b64 = self.clients.call_image_model(image_prompt, self.params['img_model'])
@@ -105,18 +105,38 @@ class ContentGenerator:
         # Add exploration history context
         user_prompt = ""
         if memories and len(memories) > 0:
+            start_date = memories[0]['date'].replace(':', ' ')
+            day_number = len(memories) + 1
+            ctx = self.params['context_length']
             user_prompt += (f"# Context\n\nToday's page is: {title}\n\n"
-                            "## Recent exploration history (most recent first):\n")
-            for i, memory in enumerate(reversed(memories[-self.params['context_length']:])):
+                            f"## Journey info\n\nYou started this exploration on {start_date} (day 1). Today is day {day_number}.\n\n")
+
+            # Older memories (titles only)
+            older = memories[:-ctx] if len(memories) > ctx else []
+            older = older[-100:]
+            if older:
+                user_prompt += "## Earlier exploration (titles only, oldest first):\n"
+                for i, memory in enumerate(older):
+                    user_prompt += f"{i + 1}. {memory['title']}\n"
+                user_prompt += "\n"
+
+            # Recent memories (title + summary)
+            recent = memories[-ctx:]
+            user_prompt += "## Recent exploration history (most recent first):\n"
+            for i, memory in enumerate(reversed(recent)):
                 user_prompt += f"{i + 1}. {memory['title']}: {memory['summary']}\n"
             user_prompt += f"\nEach page led to the next, e.g. you arrived at '{title}' from page '{memories[-1]['title']}'.\n\n"
 
             user_prompt += f"# Yesterday's thread\n\n{format_tweet(memories[-1]['tweets'], remove_url=True)}\n\n"
-
+        else:
+            user_prompt += (f"# Context\n\nToday's page is: {title}\n\n"
+                            "## Journey info\n\nThis is DAY 1 — the very first step of your Wikipedia exploration! "
+                            "Comment on this new beginning: you're starting a journey through Wikipedia, hopping from page to page by following links, "
+                            "and you have no idea where it will take you.\n\n")
 
         # Create user prompt with exploration context
         user_prompt += (f"# Task\n\n"
-                        f"Today's title is: {title}. The text is:\n\n<WIKIPEDIA>\n\n{text}\n\n</WIKIPEDIA>\n\n"
+                        f"Today's page is: {title}. The text is:\n\n<WIKIPEDIA>\n\n{text}\n\n</WIKIPEDIA>\n\n"
                         f"Please write today's thread now!")
 
         # Call the model
@@ -129,7 +149,7 @@ class ContentGenerator:
         text = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=800)
 
         # Add Wikipedia URL to the end if not already included
-        text = text + f'\nlearn more: {page.fullurl}'
+        text = f"{text}\n\nlearn more: {page.fullurl}"
 
         # Split into tweets
         tweets = split_tweets(text)

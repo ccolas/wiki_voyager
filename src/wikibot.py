@@ -37,7 +37,7 @@ class WikiBot:
         self.img_path = os.path.join(self.bot_path, 'imgs') + '/'
         self.memory_path = os.path.join(self.bot_path, 'memory.jsonl')
         self.params['img_path'] = self.img_path
-        self.params['project_path'] = project_path 
+        self.params['project_path'] = project_path
 
         os.makedirs(self.bot_path, exist_ok=True)
         os.makedirs(self.img_path, exist_ok=True)
@@ -113,7 +113,7 @@ class WikiBot:
                 continue
 
             # Publish content
-            if publish and not debug:
+            if publish:
                 print('    publishing tweet', end='\r')
                 tweet_url = self.publish(new_tweets, new_img_info)
             else:
@@ -177,29 +177,39 @@ class WikiBot:
         # Upload media if available
         media_id = None
         if img_info is not None:
-            media = self.clients.twitter_client_v1.media_upload(filename=img_info['path'])
-            media_id = media.media_id
+            try:
+                media_id = self.clients.upload_media(img_info['path'])
+            except Exception as e:
+                print(f'    [twitter] media upload failed (posting without image): {type(e).__name__}: {e}')
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f'    [twitter] status={e.response.status_code} body={e.response.text}')
 
         # Publish tweets
         previous_tweet_id = None
         tweet_url = None
 
         for tweet in tweets:
-            if previous_tweet_id is not None:
-                new_tweet = self.clients.twitter_client_v2.create_tweet(
-                    text=tweet,
-                    in_reply_to_tweet_id=previous_tweet_id
-                )
-            else:
-                if media_id is not None:
+            try:
+                if previous_tweet_id is not None:
                     new_tweet = self.clients.twitter_client_v2.create_tweet(
                         text=tweet,
-                        media_ids=[media_id]
+                        in_reply_to_tweet_id=previous_tweet_id
                     )
                 else:
-                    new_tweet = self.clients.twitter_client_v2.create_tweet(
-                        text=tweet
-                    )
+                    if media_id is not None:
+                        new_tweet = self.clients.twitter_client_v2.create_tweet(
+                            text=tweet,
+                            media_ids=[media_id]
+                        )
+                    else:
+                        new_tweet = self.clients.twitter_client_v2.create_tweet(
+                            text=tweet
+                        )
+            except Exception as e:
+                print(f'    [twitter] create_tweet failed: {type(e).__name__}: {e}')
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f'    [twitter] status={e.response.status_code} body={e.response.text}')
+                raise
 
             previous_tweet_id = new_tweet.data['id']
 
