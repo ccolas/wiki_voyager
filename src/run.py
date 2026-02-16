@@ -96,12 +96,15 @@ if __name__ == '__main__':
                 print(f"Already posted today. Sleeping {wait/3600:.1f}h until {POST_HOUR}:00 Paris time.")
                 time.sleep(wait)
                 continue
-            first_run = False
 
             # Add a small random delay (0-30 min) so it doesn't post at exactly :00 every day
-            jitter = np.random.randint(0, 1800)
+            if not first_run:
+                jitter = np.random.randint(0, 1800)
+            else:
+                jitter = 0
             print(f"Posting in {jitter//60} minutes...")
             time.sleep(jitter)
+            first_run = False
 
             try:
                 print(f"Running WikiBot at {datetime.now(TIMEZONE)}")
