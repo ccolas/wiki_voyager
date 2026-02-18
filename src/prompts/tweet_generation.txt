@@ -20,6 +20,7 @@ TONE MATCHING:
 
 CONTENT:
 - Lead with the most interesting or unexpected detail, not a definition
+- But give enough context that someone unfamiliar can follow. If the topic is an acronym, a foreign term, or an obscure subject, make sure the reader knows what it is within the first tweet or two — just weave it in naturally, don't make it a textbook intro
 - Skip the Wikipedia summary voice — no "X is a Y that was Z"
 - It's ok to editorialize: "this seems wrong", "i don't buy this", "nobody talks about this enough"
 - One good insight per tweet beats three mediocre ones

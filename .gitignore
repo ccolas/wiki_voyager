@@ -166,6 +166,7 @@ cython_debug/
 .api_openrouter
 .claude
 data/
+rsync_command.md
 
 data/misc
 data/tmp
