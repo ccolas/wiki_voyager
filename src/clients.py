@@ -1,6 +1,7 @@
 """
-API clients for WikiBot (Twitter, OpenAI, Wikipedia).
+API clients for WikiBot (Twitter, OpenAI, OpenRouter, Wikipedia).
 """
+import json
 import time
 import numpy as np
 import tiktoken
@@ -13,7 +14,12 @@ import os
 
 
 class ContentFilterError(Exception):
-    """Raised when OpenAI refuses a request due to content policy."""
+    """Raised when an API refuses a request due to content policy."""
+    pass
+
+
+class CreditsExhaustedError(Exception):
+    """Raised when OpenRouter credits are depleted."""
     pass
 
 class APIClients:
@@ -21,7 +27,7 @@ class APIClients:
     Wrapper for all API clients used by WikiBot.
     """
 
-    def __init__(self, project_path, openai_api_key, twitter_api_keys):
+    def __init__(self, project_path, openai_api_key, twitter_api_keys, openrouter_api_key=None):
         """
         Initialize API clients with their respective keys.
 
@@ -29,8 +35,10 @@ class APIClients:
             openai_api_key (str): OpenAI API key
             twitter_api_keys (list): Twitter API keys in order:
                 [api_key, api_secret, bearer, access_token, access_token_secret]
+            openrouter_api_key (str): OpenRouter API key (for Claude etc.)
         """
         self.openai_api_key = openai_api_key
+        self.openrouter_api_key = openrouter_api_key
         self.twitter_api_keys = twitter_api_keys
         self.project_path = project_path
 
@@ -39,28 +47,52 @@ class APIClients:
         self.twitter_auth = self._setup_twitter_auth()
         self.twitter_client_v2 = self._setup_twitter_v2()
         self.openai_client = self._setup_openai()
+        self.openrouter_client = self._setup_openrouter()
         self.encoder = tiktoken.get_encoding("o200k_base")
 
-        self.input_tokens = 0
-        self.output_tokens = 0
+        self.usage_path = os.path.join(self.project_path, 'data', 'usage.json')
+        self.usage = {}  # model -> {input_tokens, output_tokens}
         self.img_count = 0
         self.load_usage()
 
+    # Per-model pricing (USD per million tokens)
+    MODEL_PRICING = {
+        'gpt-4o-mini-2024-07-18': (0.15, 0.60),
+        'anthropic/claude-haiku-4.5': (0.80, 4.00),
+        'google/gemini-2.0-flash-001': (0.10, 0.40),
+        'google/gemini-2.0-flash-lite-001': (0.075, 0.30),
+        'gpt-image-1-mini': (0.0, 0.0),  # tracked via img_count
+    }
+    IMG_COST = 0.02  # per image
+
     def load_usage(self):
-        if os.path.exists(self.project_path + 'data/usage.txt'):
-            with open(self.project_path + 'data/usage.txt', 'r') as f:
-                usage_txt = f.read()
-            self.input_tokens, self.output_tokens, self.img_count = [int(val) for val in usage_txt.split('\n')]
+        if os.path.exists(self.usage_path):
+            with open(self.usage_path, 'r') as f:
+                data = json.load(f)
+            self.usage = data.get('models', {})
+            self.img_count = data.get('img_count', 0)
 
     def save_usage(self):
-        usage_txt = '\n'.join([str(val) for val in [self.input_tokens, self.output_tokens, self.img_count]])
-        with open(self.project_path + 'data/usage.txt', 'w') as f:
-            f.write(usage_txt)
+        data = {'models': self.usage, 'img_count': self.img_count}
+        with open(self.usage_path, 'w') as f:
+            json.dump(data, f, indent=2)
 
-    def print_costs(self):
-        total_cost = self.img_count * 0.02 + self.input_tokens / 1e6 * 0.15 + self.output_tokens / 1e6 * 0.60
-        cost_per_day = total_cost / self.img_count
-        print(f'costs: USD {total_cost:.2f}, USD {cost_per_day*100:.2f} cts/day')
+    def track_tokens(self, model, input_tokens, output_tokens):
+        if model not in self.usage:
+            self.usage[model] = {'input_tokens': 0, 'output_tokens': 0}
+        self.usage[model]['input_tokens'] += input_tokens
+        self.usage[model]['output_tokens'] += output_tokens
+        self.save_usage()
+
+    def print_costs(self, n_runs=None):
+        total_cost = self.img_count * self.IMG_COST
+        for model, counts in self.usage.items():
+            in_price, out_price = self.MODEL_PRICING.get(model, (0.50, 2.00))  # default conservative
+            total_cost += counts['input_tokens'] / 1e6 * in_price + counts['output_tokens'] / 1e6 * out_price
+        if n_runs and n_runs > 0:
+            print(f'costs: ${total_cost:.3f} total, ${total_cost/n_runs*100:.2f} cts/run')
+        else:
+            print(f'costs: ${total_cost:.3f} total')
 
     def _setup_wikipedia(self):
         """Set up Wikipedia API client."""
@@ -124,19 +156,35 @@ class APIClients:
         """Set up OpenAI client."""
         return OpenAI(api_key=self.openai_api_key, timeout=50.0)
 
+    def _setup_openrouter(self):
+        """Set up OpenRouter client (OpenAI-compatible)."""
+        if not self.openrouter_api_key:
+            return None
+        return OpenAI(
+            api_key=self.openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=60.0
+        )
+
     def call_text_model(self, messages, model="gpt-4o-mini-2024-07-18", max_tokens=1000):
         """
-        Call OpenAI text model with retry logic.
+        Call a text model with retry logic. Routes to OpenAI or OpenRouter based on model name.
 
         Args:
             messages (list): List of message dictionaries
             model (str): Model name to use
-            response_model: Pydantic model for response parsing
             max_tokens (int): Maximum tokens to generate
 
         Returns:
             The model's response
         """
+        if model.startswith('gpt-') or model.startswith('o1'):
+            return self._call_openai(messages, model, max_tokens)
+        else:
+            return self._call_openrouter(messages, model, max_tokens)
+
+    def _call_openai(self, messages, model, max_tokens):
+        """Call OpenAI API with retry logic."""
         i_attempt = 0
         response = None
         error = ""
@@ -149,10 +197,8 @@ class APIClients:
                     messages=messages,
                     max_tokens=max_tokens
                 )
-                self.output_tokens += response.usage.completion_tokens
-                self.input_tokens += response.usage.prompt_tokens
+                self.track_tokens(model, response.usage.prompt_tokens, response.usage.completion_tokens)
                 output = response.choices[0].message.content
-                self.save_usage()
                 return output
             except Exception as err:
                 error = str(err)
@@ -163,6 +209,39 @@ class APIClients:
 
         if response is None:
             raise RuntimeError(f"Error in text model call: {error}")
+
+    def _call_openrouter(self, messages, model, max_tokens):
+        """Call OpenRouter API (OpenAI-compatible) with retry logic."""
+        if not self.openrouter_client:
+            raise ValueError("OpenRouter API key not set")
+
+        i_attempt = 0
+        response = None
+        error = ""
+
+        while i_attempt < 5:
+            i_attempt += 1
+            try:
+                response = self.openrouter_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens
+                )
+                if response.usage:
+                    self.track_tokens(model, response.usage.prompt_tokens, response.usage.completion_tokens)
+                output = response.choices[0].message.content
+                return output
+            except Exception as err:
+                error = str(err)
+                if '402' in error or 'credit' in error.lower() or 'insufficient' in error.lower():
+                    raise CreditsExhaustedError(f"OpenRouter credits exhausted: {error}")
+                if 'content_policy' in error or 'content policy' in error.lower() or 'safety' in error.lower():
+                    raise ContentFilterError(f"Content filtered: {error}")
+                print(f'API error: {error}')
+                time.sleep(np.random.randint(5, 60))
+
+        if response is None:
+            raise RuntimeError(f"Error in OpenRouter call: {error}")
 
     def call_image_model(self, prompt, model='gpt-image-1-mini', size="1024x1024", quality='low'):
         """

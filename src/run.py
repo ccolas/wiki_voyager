@@ -10,8 +10,8 @@ import zoneinfo
 
 from wikibot import WikiBot
 
-DEBUG = False
-PUBLISH = True
+DEBUG = True
+PUBLISH = False
 POST_HOUR = 19  # 7pm Paris time
 TIMEZONE = zoneinfo.ZoneInfo("Europe/Paris")
 
@@ -23,16 +23,20 @@ def read_api_keys(project_path):
     with open(os.path.join(project_path, '.api_twitter'), 'r') as f:
         twitter_api_keys = f.read().strip().split('\n')
 
-    return openai_api_key, twitter_api_keys
+    with open(os.path.join(project_path, 'src', '.api_openrouter'), 'r') as f:
+        openrouter_api_key = f.read().strip()
+
+    return openai_api_key, twitter_api_keys, openrouter_api_key
 
 PARAMS = {
     'unwanted_strings': ['wiki', 'Wiki', 'Category', 'List', 'Template',
                          'Help', 'ISO', 'User', 'Talk', 'Portal', '501'],
-    'text_model': "gpt-4o-mini-2024-07-18",
+    'tweet_model': "anthropic/claude-haiku-4.5",
+    'link_model': "google/gemini-2.0-flash-001",
     'img_model': "gpt-image-1-mini",
-    'to_skip': [],
+    'to_skip': ['publish'],
     'context_length': 30,
-    'n_link_options': 19,
+    'n_link_options': 100,
     'debug': DEBUG
 }
 
@@ -42,7 +46,7 @@ if __name__ == '__main__':
     project_path = os.path.dirname(script_path) + '/'
 
     # Read API keys
-    openai_api_key, twitter_api_keys = read_api_keys(project_path)
+    openai_api_key, twitter_api_keys, openrouter_api_key = read_api_keys(project_path)
 
     # Bot configuration
     bot_name = 'twitter_trail'
@@ -58,6 +62,7 @@ if __name__ == '__main__':
         project_path=project_path,
         openai_api_key=openai_api_key,
         twitter_api_keys=twitter_api_keys,
+        openrouter_api_key=openrouter_api_key,
         params=PARAMS
     )
 
@@ -81,7 +86,7 @@ if __name__ == '__main__':
 
     if DEBUG:
         # Debug mode: run immediately, up to 10 steps
-        for i_step in range(5):
+        for i_step in range(15):
             print(f"[debug] Running step {i_step + 1}")
             try:
                 wikibot.generate_and_publish(publish=PUBLISH, debug=DEBUG)

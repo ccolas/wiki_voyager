@@ -7,7 +7,7 @@ from PIL import Image
 from pydantic import BaseModel
 from typing import Optional
 
-from utils import format_tweet
+from utils import format_tweet, get_formatted_date
 from tweet_splitter import split_tweets
 from clients import ContentFilterError
 
@@ -104,11 +104,12 @@ class ContentGenerator:
 
         # Add exploration history context
         user_prompt = ""
+        today = get_formatted_date()
         if memories and len(memories) > 0:
             start_date = memories[0]['date'].replace(':', ' ')
             day_number = len(memories) + 1
             ctx = self.params['context_length']
-            user_prompt += (f"# Context\n\nToday's page is: {title}\n\n"
+            user_prompt += (f"# Context\n\nToday is {today}. Today's page is: {title}\n\n"
                             f"## Journey info\n\nYou started this exploration on {start_date} (day 1). Today is day {day_number}.\n\n")
 
             # Older memories (titles only)
@@ -129,7 +130,7 @@ class ContentGenerator:
 
             user_prompt += f"# Yesterday's thread\n\n{format_tweet(memories[-1]['tweets'], remove_url=True)}\n\n"
         else:
-            user_prompt += (f"# Context\n\nToday's page is: {title}\n\n"
+            user_prompt += (f"# Context\n\nToday is {today}. Today's page is: {title}\n\n"
                             "## Journey info\n\nThis is DAY 1 — the very first step of your Wikipedia exploration! "
                             "Comment on this new beginning: you're starting a journey through Wikipedia, hopping from page to page by following links, "
                             "and you have no idea where it will take you.\n\n")
@@ -146,7 +147,7 @@ class ContentGenerator:
         #           'PROMPT FOR SUMMARIZER')
         #     for m in messages:
         #         print(f'\n\n{m["role"]}\n{m["content"]}')
-        text = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=800)
+        text = self.clients.call_text_model(messages, self.params['tweet_model'], max_tokens=800)
 
         # Add Wikipedia URL to the end if not already included
         text = f"{text}\n\nlearn more: {page.fullurl}"

@@ -8,6 +8,8 @@ def split_tweets(text, max_length=280):
 
     for tweet in tweets:
         tweet = tweet.strip()
+        if not tweet:
+            continue
         if len(tweet) <= max_length:
             result.append(tweet)
         else:

@@ -3,6 +3,7 @@ Main WikiBot class for exploring Wikipedia and publishing content.
 """
 import os
 import json
+import re
 import time
 import numpy as np
 import wikipedia
@@ -18,7 +19,7 @@ class WikiBot:
     """
 
     def __init__(self, name, project_path, openai_api_key, twitter_api_keys,
-                 seed_page_id='Exploration', params=None):
+                 openrouter_api_key=None, seed_page_id='Exploration', params=None):
         """
         Initialize the WikiBot.
 
@@ -43,7 +44,7 @@ class WikiBot:
         os.makedirs(self.img_path, exist_ok=True)
 
         # Initialize API clients
-        self.clients = APIClients(project_path, openai_api_key, twitter_api_keys)
+        self.clients = APIClients(project_path, openai_api_key, twitter_api_keys, openrouter_api_key)
 
         # Initialize content generator
         self.content_generator = ContentGenerator(self.clients, self.params)
@@ -89,7 +90,7 @@ class WikiBot:
         for attempt in range(max_retries):
             # Find new page (excluding filtered ones)
             print('  searching for new page', end='\r')
-            new_title, new_page = self.get_next_page(self.params['n_link_options'], skip_titles=filtered_titles)
+            new_title, new_page, nav_reasoning = self.get_next_page(self.params['n_link_options'], skip_titles=filtered_titles)
             this_id = self.get_id(new_title)
             print(f'  step #{len(self.memories)+1}: {new_title}')
 
@@ -120,24 +121,15 @@ class WikiBot:
                 tweet_url = None
 
             # Save to memory
-            memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url)
-            self.clients.print_costs()
+            memory = self.update_memory(this_id, new_title, new_page, new_date, new_tweets, new_img_info, tweet_url, nav_reasoning)
+            self.clients.print_costs(n_runs=len(self.memories))
             return memory
 
         raise RuntimeError(f"Failed after {max_retries} attempts due to content filtering")
 
-    def update_memory(self, this_id, title, page, date, tweet, img_info, tweet_url):
+    def update_memory(self, this_id, title, page, date, tweet, img_info, tweet_url, nav_reasoning=None):
         """
         Update bot memory with new content.
-
-        Args:
-            this_id (str): Page ID
-            title (str): Page title
-            page: Wikipedia page object
-            date (str): Formatted date
-            tweet (list): List of tweets
-            img_info (dict): Image information
-            tweet_url (str): URL to the published tweet
         """
         new_mem = {
             'title': title,
@@ -148,7 +140,8 @@ class WikiBot:
             'tweets': tweet,
             'date': date,
             'img_info': img_info,
-            'tweet_url': tweet_url
+            'tweet_url': tweet_url,
+            'nav_reasoning': nav_reasoning
         }
 
         self.memories.append(new_mem)
@@ -248,15 +241,18 @@ class WikiBot:
                 links = current_page.links
 
                 # Filter out already visited pages and unwanted pages
+                # First 40 with summaries, next 60 title-only
                 filtered_links = []
                 linked_pages = list(links.values())
                 np.random.shuffle(linked_pages)
+                n_with_summary = 40
                 for linked_page in linked_pages:
-                    if linked_page.title not in filtered_links:
-                        link = self.get_link(linked_page, skip_titles)
+                    if linked_page.title not in [l['title'] for l in filtered_links]:
+                        with_summary = len(filtered_links) < n_with_summary
+                        link = self.get_link(linked_page, skip_titles, with_summary=with_summary)
                         if link is not None:
                             filtered_links.append(link)
-                        if len(filtered_links) > max_links:
+                        if len(filtered_links) >= max_links:
                             break
 
                 if len(filtered_links) == 0:
@@ -266,7 +262,7 @@ class WikiBot:
                     continue
 
                 # Rank the links
-                new_page = self.select_link(current_page, filtered_links)
+                new_page, reasoning = self.select_link(current_page, filtered_links)
 
                 # Check that the page has content
                 if new_page is None:
@@ -275,7 +271,7 @@ class WikiBot:
                     continue
 
                 title = clean_title(new_page.displaytitle)
-                return title, new_page
+                return title, new_page, reasoning
 
             except Exception as e:
                 print(f'    error in finding next page: {str(e)}')
@@ -285,7 +281,7 @@ class WikiBot:
 
         raise RuntimeError("No new page found after exhausting all options")
 
-    def get_link(self, page, skip_titles=None):
+    def get_link(self, page, skip_titles=None, with_summary=True):
         title = page.title
 
         # Skip already visited pages
@@ -301,11 +297,22 @@ class WikiBot:
             if unwanted in title:
                 return None
 
-        # Check if page exists
-        if not self.clients.page_exists(page) or not page.summary:
-            return None
+        if with_summary:
+            # Full check: verify page exists and get summary
+            if not self.clients.page_exists(page) or not page.summary:
+                return None
+            link = {'title': page.displaytitle, 'url': page.fullurl, 'page_obj': page}
+            # Strip parenthetical noise (transliterations, acronyms, etc.)
+            clean = re.sub(r'\([^)]*\)', '', page.summary).strip()
+            sentences = clean.split('. ')
+            short = '. '.join(sentences[:2]).strip()
+            if not short.endswith('.'):
+                short += '.'
+            link['summary'] = short[:150]
+        else:
+            # Title-only: skip API call, just filter by name
+            link = {'title': title, 'page_obj': page}
 
-        link = {'summary': self.get_summary(page), 'title': page.displaytitle, 'url': page.fullurl, 'page_obj': page}
         return link
 
 
@@ -322,36 +329,73 @@ class WikiBot:
             list: Ranked list of link titles with reasoning
         """
         if len(filtered_links) == 1:
-            return filtered_links[0]['page_obj']
+            return filtered_links[0]['page_obj'], None
 
 
         # Build the prompt
         system_prompt = (
-            "You are an AI agent on a journey through Wikipedia, moving each day from one page to the next by following interesting links, never reading the same page twice."
-            "Given a set of links and recent exploration trajectories, your task is to rank available links as a function of your interest in exploring them next."
+            "You are an AI agent on a journey through Wikipedia, moving each day from one page to the next by following interesting links, never reading the same page twice. "
+            "You share a voice with the tweet writer — together you are the same agent. The tweets reflect your curiosity and sometimes hint at where you'd like to go next.\n\n"
+            "There are two kinds of curiosity that drive exploration:\n"
+            "- Depth: following a thread, pulling on a loose end, wanting to understand something more fully\n"
+            "- Breadth: jumping sideways, letting an unexpected connection carry you somewhere new, wandering into unfamiliar territory. "
+            "You can even set yourself a destination — 'I want to get to music' or 'I want to reach something about food' — and then pick links that are stepping stones toward it\n\n"
+            "Both are valuable. A good journey alternates between them — spending a few days going deep on something, "
+            "then drifting to something unrelated, then finding a new thread to pull. "
+            "The worst version of this journey is one that stays in the same neighborhood forever because every next step feels like the most logical one.\n\n"
+            "Remember: Wikipedia is vast. You could end up learning about Polynesian navigation, the history of anesthesia, "
+            "the economy of Mongolia, or the philosophy of boredom — if you find a path there. Every page is a few links away from somewhere completely different. "
+            "The path doesn't have to be obvious — a person mentioned in passing, a place name, a technique, a date — any of these can be a door out.\n\n"
+            "When reasoning about your next move, think honestly about which mode you've been in lately and whether it's time to switch. "
+            "If you want to break out, look for hub pages — broad concepts, places, historical periods, scientific fields — "
+            "that would open many directions on the next step, rather than narrow pages that keep you where you are."
         )
 
         user_prompt = (f"# Context\n\n"
-                       f"## Yesterday's page\n\n{current_page.displaytitle}: {current_page.summary[:200]}...\n\n")
+                       f"## Current page\n\n{current_page.displaytitle}: {current_page.summary[:200]}...\n\n")
 
         if len(self.memories) > 0:
-            user_prompt += f"## Yesterday's thread:\n\n{format_tweet(self.memories[-1]['tweets'])}\n\n"
-            user_prompt += "## Earlier pages (most recent first)\n"
+            user_prompt += f"## Latest thread:\n\n{format_tweet(self.memories[-1]['tweets'])}\n\n"
+            user_prompt += "## Recent trajectory (most recent first)\n"
             for i, memory in enumerate(reversed(self.memories[-self.params['context_length']:])):
                 user_prompt += f"{i + 1}. {memory['title']}: {memory['summary']}\n"
             user_prompt += "\n"
 
-        user_prompt += "# Available links to explore\n"
-        for i, link in enumerate(filtered_links):
-            user_prompt += f"{i + 1}. <title>{link['title']}</title> {link['summary']}\n\n"
+            # Show recent navigation reasoning so the selector remembers its own intentions
+            recent_reasoning = [m.get('nav_reasoning') for m in self.memories[-3:] if m.get('nav_reasoning')]
+            if recent_reasoning:
+                user_prompt += "## Your recent navigation thinking (last few steps)\n"
+                for i, r in enumerate(recent_reasoning):
+                    user_prompt += f"- Step {len(self.memories) - len(recent_reasoning) + i + 1}: {r}\n"
+                user_prompt += "\n"
+
+        # Split links into those with summaries and title-only
+        links_with_summary = [l for l in filtered_links if 'summary' in l]
+        links_title_only = [l for l in filtered_links if 'summary' not in l]
+
+        user_prompt += "# Available links to explore\n\n"
+        if links_with_summary:
+            user_prompt += "## Links with descriptions\n"
+            for i, link in enumerate(links_with_summary):
+                user_prompt += f"{i + 1}. <title>{link['title']}</title> {link['summary']}\n"
+            user_prompt += "\n"
+        if links_title_only:
+            user_prompt += "## More links (titles only)\n"
+            user_prompt += ", ".join(f"<title>{l['title']}</title>" for l in links_title_only)
+            user_prompt += "\n\n"
 
         user_prompt += (
-            "\nTASK:\nPlease rank the top 5 most interesting links to explore next. "
-            "For each link, provide a brief reason why it would be interesting to explore. "
-            "\nFormat your response as numbered list with the exact link title (same format, case, tags, etc) in <title></title> tags, followed by your reasoning:\n"
-            "1. <title>title 1</title> reasoning\n"
-            "2. <title><i>title 2</i></title> reasoning\n"
-            "...\n\n"
+            "TASK:\n"
+            "1. First, reason about your journey and decide your strategy for this step.\n"
+            "2. Then declare: <strategy>DEPTH</strategy> or <strategy>BREADTH</strategy>\n"
+            "3. If BREADTH: you MUST pick a link that is outside the current topic. Look for pages about different subjects, places, people, or fields. "
+            "Do NOT pick another page in the same narrow category.\n"
+            "4. If DEPTH: pick the most interesting link to go deeper on the current thread.\n"
+            "5. Pick ONE link. Use the exact title in <title></title> tags.\n\n"
+            "Format:\n"
+            "<reasoning>your thinking here</reasoning>\n"
+            "<strategy>DEPTH or BREADTH</strategy>\n\n"
+            "Choice: <title>exact title</title>\n"
         )
 
         # Call the LLM
@@ -361,56 +405,29 @@ class WikiBot:
         ]
         
            
-        response = self.clients.call_text_model(messages, self.params['text_model'], max_tokens=500)
+        response = self.clients.call_text_model(messages, self.params['link_model'], max_tokens=500)
 
-        # Parse the response to extract ranked links
-        ranked_links = []
-        lines = response.split('\n')
-        current_link = None
+        if self.params['debug']:
+            print(f'################\n Selection\n\n{response}')
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        # Extract reasoning
+        reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', response, re.DOTALL)
+        reasoning = reasoning_match.group(1).strip() if reasoning_match else None
 
-            # Look for numbered items
-            if line[0].isdigit() and '. ' in line:
-                parts = line.split('. ', 1)
-                if len(parts) >= 2:
-                    text = parts[1].strip('<title>')
-                    link_title = text.split('</title>', 1)[0] if '</title>' in text else text
-                    link_title = link_title.strip()
+        # Parse the response — find <title>...</title>, last occurrence is the choice
+        titles_found = re.findall(r'<title>(.*?)</title>', response)
 
-                    # Check if this link exists in our context dict
-                    for link in filtered_links:
-                        title = link['title']
-                        if title.lower() == link_title.lower() or title.lower() in link_title.lower() or link_title.lower() in title.lower():
-                            current_link = {
-                                'title': title,
-                                'rank': int(parts[0]),
-                                'page_obj': link['page_obj']
-                            }
-                            ranked_links.append(current_link)
-                            break
-        # Sort by rank
-        ranked_links.sort(key=lambda x: x['rank'])
+        # Match against available links (last title found is the choice)
+        for chosen_title in reversed(titles_found):
+            chosen_title = chosen_title.strip()
+            for link in filtered_links:
+                title = link['title']
+                if title.lower() == chosen_title.lower() or title.lower() in chosen_title.lower() or chosen_title.lower() in title.lower():
+                    return link['page_obj'], reasoning
 
-        if not ranked_links:
-            # No ranked links, use fallback to random selection
-            print('      no ranked links, using random selection')
-            return filtered_links[np.random.choice(range(len(filtered_links)))]['page_obj']
-        else:
-            # Use a weighted selection from the ranked links
-            # 70% chance of picking the top link, 30% chance of random from top 3
-            if np.random.random() < 0.7 or len(ranked_links) == 1:
-                # Pick the top-ranked link
-                selected_link = ranked_links[0]
-            else:
-                # Pick randomly from top 3 (or fewer if less available)
-                top_n = min(3, len(ranked_links))
-                selected_link = ranked_links[np.random.randint(0, top_n)]
-            new_page = selected_link['page_obj']
-        return new_page
+        # Fallback to random selection
+        print('      could not parse choice, using random selection')
+        return filtered_links[np.random.choice(range(len(filtered_links)))]['page_obj'], reasoning
 
     def get_summary(self, page):
         summary = page.summary.split('. ')

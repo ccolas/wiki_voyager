@@ -76,6 +76,6 @@ def format_tweet(tweets, remove_url=False):
     for t in tweets:
         if 'learn more: http' in t and remove_url:
             t = t.split('learn more: http')[0]
-        s += f'{t}\n***\n'
+        s += f'{t.strip()}\n***\n'
     s = s[:-5]
     return s
