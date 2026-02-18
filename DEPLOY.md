@@ -11,9 +11,9 @@ python src/run.py
 
 ### tmux cheatsheet
 
-| Action | Keys |
-|---|---|
-| Detach (leave running) | `Ctrl+B` then `D` |
-| Reattach | `tmux attach -t wikibot` |
-| List sessions | `tmux ls` |
-| Kill session | `tmux kill-session -t wikibot` |
+| Action | Keys                           |
+|---|--------------------------------|
+| Detach (leave running) | `Ctrl+B` then `D`              |
+| Reattach | `tmux attach -t wiki_voyager`  |
+| List sessions | `tmux ls`                      |
+| Kill session | `tmux kill-session -t wiki_voyager` |

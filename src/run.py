@@ -10,8 +10,8 @@ import zoneinfo
 
 from wikibot import WikiBot
 
-DEBUG = True
-PUBLISH = False
+DEBUG = False
+PUBLISH = True
 POST_HOUR = 19  # 7pm Paris time
 TIMEZONE = zoneinfo.ZoneInfo("Europe/Paris")
 
@@ -34,7 +34,7 @@ PARAMS = {
     'tweet_model': "anthropic/claude-haiku-4.5",
     'link_model': "google/gemini-2.0-flash-001",
     'img_model': "gpt-image-1-mini",
-    'to_skip': ['publish'],
+    'to_skip': [],
     'context_length': 30,
     'n_link_options': 100,
     'debug': DEBUG
@@ -94,7 +94,7 @@ if __name__ == '__main__':
                 print(f"Error: {e}")
     else:
         # Production: post immediately on first run, then daily at POST_HOUR
-        first_run = True
+        first_run = False
         while True:
             if not first_run and already_posted_today():
                 wait = seconds_until_post()
